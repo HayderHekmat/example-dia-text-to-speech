@@ -1,0 +1,15 @@
+[project]
+name = "backend"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi[standard]>=0.115.13",
+    "pydantic>=2.11.5",
+    "soundfile>=0.13.1",
+    "torch>=2.7.1",
+    "transformers[torch]>=4.53.0",
+]
+
+
