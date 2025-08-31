@@ -587,8 +587,3 @@ async def get_stats():
     except Exception as e:
         logger.error(f"Error getting stats: {e}")
         raise HTTPException(status_code=500, detail="Error retrieving statistics")
-
-# Add this to your requirements.txt:
-# soundfile==0.12.1
-# scipy==1.13.1
-# numpy==1.26.4
