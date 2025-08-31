@@ -24,7 +24,7 @@ COPY . .
 
 # Sync the project
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked
+    uv sync
 
 # Create directory for audio files
 RUN mkdir -p audio_files
