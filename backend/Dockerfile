@@ -17,7 +17,7 @@ COPY pyproject.toml uv.lock ./
 
 # Install dependencies
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-install-project
+    uv sync --no-install-project
 
 # Copy the project into the image
 COPY . .
