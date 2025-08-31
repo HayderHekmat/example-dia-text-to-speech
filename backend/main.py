@@ -2,20 +2,23 @@ import logging
 from contextlib import asynccontextmanager
 import os
 import uuid
+import json
+import re
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 import time
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from pathlib import Path
 
 import torch
 from transformers import AutoProcessor, DiaForConditionalGeneration
-
-from utils import process_audio_prompt
+import soundfile as sf
+import numpy as np
+from scipy import signal
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,17 +32,6 @@ AUDIO_DIR = Path("audio_files")
 AUDIO_DIR.mkdir(exist_ok=True, parents=True)
 UPLOADS_DIR = Path("upload_files")
 UPLOADS_DIR.mkdir(exist_ok=True, parents=True)
-
-# Clean up old files on startup (keep last 100 files)
-def cleanup_old_files(directory: Path, max_files: int = 100):
-    try:
-        files = sorted(directory.glob("*.wav"), key=os.path.getctime)
-        if len(files) > max_files:
-            for file in files[:-max_files]:
-                file.unlink()
-                logger.info(f"Cleaned up old file: {file}")
-    except Exception as e:
-        logger.warning(f"Error cleaning up old files: {e}")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info(f"Using DEVICE: {DEVICE}")
@@ -131,11 +123,173 @@ class GenerateRequest(BaseModel):
     cfg_filter_top_k: int = 35
     speed_factor: float = 0.94
 
+class VapiMessage(BaseModel):
+    timestamp: int
+    type: str
+    status: str
+    role: str
+    turn: int
+    artifact: Dict[str, Any]
+    call: Dict[str, Any]
+    assistant: Dict[str, Any]
+
+class VapiRequest(BaseModel):
+    message: VapiMessage
+
+# Sound effects mapping from your Svelte component
+SOUND_EFFECTS = {
+    'burps': {'type': 'short', 'duration': 0.8, 'pitch_shift': -4},
+    'clears throat': {'type': 'throat', 'duration': 1.2, 'pitch_shift': 0},
+    'coughs': {'type': 'short', 'duration': 0.7, 'pitch_shift': 2},
+    'exhales': {'type': 'breath', 'duration': 1.5, 'pitch_shift': -2},
+    'gasps': {'type': 'breath', 'duration': 0.9, 'pitch_shift': 6},
+    'groans': {'type': 'long', 'duration': 1.8, 'pitch_shift': -6},
+    'humming': {'type': 'tone', 'duration': 2.0, 'pitch_shift': 0},
+    'laughs': {'type': 'laugh', 'duration': 2.5, 'pitch_shift': 4},
+    'mumbles': {'type': 'mumble', 'duration': 1.3, 'pitch_shift': -3},
+    'screams': {'type': 'scream', 'duration': 1.1, 'pitch_shift': 8},
+    'sighs': {'type': 'breath', 'duration': 2.0, 'pitch_shift': -4},
+    'sneezes': {'type': 'short', 'duration': 0.6, 'pitch_shift': 10},
+}
+
+def generate_sound_effect(effect_name: str, samplerate: int = 24000) -> np.ndarray:
+    """Generate a synthetic sound effect based on the effect name."""
+    effect_config = SOUND_EFFECTS.get(effect_name, {})
+    duration = effect_config.get('duration', 1.0)
+    pitch_shift = effect_config.get('pitch_shift', 0)
+    effect_type = effect_config.get('type', 'short')
+    
+    samples = int(duration * samplerate)
+    t = np.linspace(0, duration, samples)
+    
+    if effect_type == 'short':
+        # Short burst sound
+        freq = 200 + pitch_shift * 20
+        sound = np.sin(2 * np.pi * freq * t) * np.exp(-5 * t)
+        
+    elif effect_type == 'long':
+        # Longer sustained sound
+        freq = 150 + pitch_shift * 15
+        sound = np.sin(2 * np.pi * freq * t) * (1 - t/duration)
+        
+    elif effect_type == 'breath':
+        # Breath-like sound
+        freq = 300 + pitch_shift * 25
+        envelope = np.exp(-2 * t) * (1 - np.exp(-10 * t))
+        sound = np.sin(2 * np.pi * freq * t) * envelope
+        
+    elif effect_type == 'throat':
+        # Throat clearing sound
+        freq1 = 100 + pitch_shift * 10
+        freq2 = 300 + pitch_shift * 30
+        sound = (0.7 * np.sin(2 * np.pi * freq1 * t) + 
+                0.3 * np.sin(2 * np.pi * freq2 * t)) * np.exp(-4 * t)
+        
+    elif effect_type == 'laugh':
+        # Laughing sound with variations
+        base_freq = 250 + pitch_shift * 20
+        mod_freq = 5  # Laugh modulation frequency
+        sound = np.sin(2 * np.pi * base_freq * t) * np.sin(2 * np.pi * mod_freq * t)
+        sound *= np.exp(-1.5 * t)
+        
+    elif effect_type == 'mumble':
+        # Mumbling sound
+        freq = 200 + pitch_shift * 15
+        mod = 8  # Modulation for mumble effect
+        sound = np.sin(2 * np.pi * freq * t) * (0.5 + 0.5 * np.sin(2 * np.pi * mod * t))
+        sound *= np.exp(-3 * t)
+        
+    elif effect_type == 'scream':
+        # Scream sound
+        freq_start = 300 + pitch_shift * 25
+        freq_end = 800 + pitch_shift * 50
+        freq = np.linspace(freq_start, freq_end, len(t))
+        sound = np.sin(2 * np.pi * freq * t) * np.exp(-2 * t)
+        
+    elif effect_type == 'tone':
+        # Simple tone for humming
+        freq = 260 + pitch_shift * 20
+        sound = np.sin(2 * np.pi * freq * t) * 0.8
+        
+    else:
+        # Default short sound
+        freq = 250 + pitch_shift * 20
+        sound = np.sin(2 * np.pi * freq * t) * np.exp(-4 * t)
+    
+    # Normalize and add some noise for realism
+    sound = sound / np.max(np.abs(sound)) * 0.7
+    if effect_type not in ['tone']:  # Don't add noise to pure tones
+        sound += np.random.normal(0, 0.02, len(sound))
+    
+    return sound
+
+def add_sound_effect_to_audio(audio_path: str, effect_name: str, position: str = "end") -> str:
+    """Add a sound effect to the generated audio at specified position."""
+    try:
+        # Read the original audio
+        data, samplerate = sf.read(audio_path)
+        
+        # Generate the sound effect
+        effect_audio = generate_sound_effect(effect_name, samplerate)
+        
+        # Ensure both arrays are 1D
+        if len(data.shape) > 1:
+            data = data[:, 0]  # Take first channel if stereo
+        
+        # Add silence before and after effect
+        silence_duration = 0.1  # 100ms silence
+        silence_samples = int(silence_duration * samplerate)
+        silence = np.zeros(silence_samples)
+        
+        # Create the effect with silence padding
+        padded_effect = np.concatenate([silence, effect_audio, silence])
+        
+        if position == "end":
+            # Add effect to the end
+            combined_audio = np.concatenate([data, padded_effect])
+        elif position == "beginning":
+            # Add effect to the beginning
+            combined_audio = np.concatenate([padded_effect, data])
+        else:
+            # Add effect at a specific time (middle by default)
+            insert_point = len(data) // 2
+            combined_audio = np.concatenate([
+                data[:insert_point],
+                padded_effect,
+                data[insert_point:]
+            ])
+        
+        # Normalize to prevent clipping
+        combined_audio = combined_audio / np.max(np.abs(combined_audio)) * 0.9
+        
+        # Save the modified audio
+        output_path = audio_path.replace('.wav', f'_{effect_name.replace(" ", "_")}.wav')
+        sf.write(output_path, combined_audio, samplerate)
+        
+        return output_path
+        
+    except Exception as e:
+        logger.error(f"Error adding sound effect '{effect_name}': {e}")
+        return audio_path  # Return original if error
+
+def extract_text_and_effects(text: str) -> tuple:
+    """Extract main text and sound effects from text containing (effect) notations."""
+    # Pattern to match sound effects in parentheses
+    pattern = r'\(([^)]+)\)'
+    effects = re.findall(pattern, text)
+    
+    # Remove effects from the main text
+    clean_text = re.sub(pattern, '', text).strip()
+    
+    # Filter only known effects
+    valid_effects = [effect for effect in effects if effect in SOUND_EFFECTS]
+    
+    return clean_text, valid_effects
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     """Handle model lifecycle during application startup and shutdown."""
     logger.info("Starting up application...")
-    cleanup_old_files(AUDIO_DIR)
     model_manager.load_model()
     yield
     logger.info("Shutting down application...")
@@ -144,7 +298,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Dia Text-to-Speech API",
-    description="API for generating speech using Dia model",
+    description="API for generating speech using Dia model with sound effects",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -163,21 +317,149 @@ async def health_check():
         "status": "ok", 
         "message": "Backend is running",
         "device": DEVICE,
-        "model_loaded": model_manager.is_loaded
+        "model_loaded": model_manager.is_loaded,
+        "supported_effects": list(SOUND_EFFECTS.keys())
     }
 
+def extract_text_from_vapi_payload(vapi_request: VapiRequest) -> str:
+    """Extract the text to synthesize from Vapi payload."""
+    try:
+        # Get the last assistant message
+        messages = vapi_request.message.artifact.get("messages", [])
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant" and msg.get("message"):
+                return msg["message"]
+        
+        # Fallback to OpenAI formatted messages
+        openai_messages = vapi_request.message.artifact.get("messagesOpenAIFormatted", [])
+        for msg in reversed(openai_messages):
+            if msg.get("role") == "assistant" and msg.get("content"):
+                return msg["content"]
+        
+        return ""
+        
+    except Exception as e:
+        logger.error(f"Error extracting text from Vapi payload: {e}")
+        return ""
+
 @app.post("/api/generate")
-async def run_inference(request: GenerateRequest):
+async def run_inference(
+    request: VapiRequest,
+    x_effect_type: Optional[str] = Header(None, alias="X-Effect-Type")
+):
     """
-    Runs Dia inference using the model and processor from model_manager and provided inputs.
-    Uses temporary files for audio prompt compatibility with inference.generate.
+    Handle Vapi speech-update requests and generate speech using Dia model with sound effects.
+    """
+    logger.info(f"Received Vapi request type: {request.message.type}, status: {request.message.status}")
+    
+    # Only process 'stopped' status for speech generation
+    if request.message.status != "stopped":
+        logger.info(f"Ignoring non-stopped status: {request.message.status}")
+        return JSONResponse(content={"status": "ignored", "reason": "only stopped status processed"})
+    
+    # Extract text from Vapi payload
+    text_to_synthesize = extract_text_from_vapi_payload(request)
+    
+    if not text_to_synthesize or text_to_synthesize.strip() == "":
+        logger.warning("No text found to synthesize in Vapi payload")
+        return JSONResponse(content={"status": "ignored", "reason": "no text to synthesize"})
+
+    # Extract text and effects
+    clean_text, detected_effects = extract_text_and_effects(text_to_synthesize)
+    
+    if not clean_text:
+        logger.warning("No clean text found after removing effects")
+        return JSONResponse(content={"status": "ignored", "reason": "no text after effect removal"})
+
+    # Generate unique filename
+    timestamp = int(time.time())
+    unique_id = str(uuid.uuid4())[:8]
+    output_filepath = AUDIO_DIR / f"{timestamp}_{unique_id}.wav"
+
+    try:
+        model = model_manager.get_model()
+        processor = model_manager.get_processor()
+
+        start_time = time.time()
+
+        # Prepare inputs with clean text (without effects)
+        processor_inputs = processor(
+            text=[clean_text],
+            padding=True,
+            return_tensors="pt"
+        )
+        processor_inputs = {k: v.to(model.device) for k, v in processor_inputs.items()}
+
+        # Generate audio
+        with torch.inference_mode():
+            logger.info(f"Starting generation for text: '{clean_text}'")
+            logger.info(f"Detected effects: {detected_effects}")
+            
+            outputs = model.generate(
+                **processor_inputs,
+                max_new_tokens=1024,
+                guidance_scale=3.0,
+                temperature=1.3,
+                top_p=0.95,
+                top_k=35
+            )
+
+        # Decode and save audio
+        decoded = processor.batch_decode(outputs)
+        processor.save_audio(decoded, str(output_filepath))
+        
+        # Apply sound effects if any were detected
+        final_output_path = str(output_filepath)
+        if detected_effects:
+            for effect in detected_effects:
+                logger.info(f"Adding sound effect: {effect}")
+                final_output_path = add_sound_effect_to_audio(final_output_path, effect, "end")
+                # Remove intermediate files
+                if final_output_path != str(output_filepath) and os.path.exists(str(output_filepath)):
+                    os.remove(str(output_filepath))
+        
+        # Apply header-based effect if specified
+        if x_effect_type and x_effect_type in SOUND_EFFECTS:
+            logger.info(f"Adding header-based effect: {x_effect_type}")
+            final_output_path = add_sound_effect_to_audio(final_output_path, x_effect_type, "end")
+            if final_output_path != str(output_filepath) and os.path.exists(str(output_filepath)):
+                os.remove(str(output_filepath))
+        
+        end_time = time.time()
+        generation_time = end_time - start_time
+        
+        logger.info(f"Final audio saved to {final_output_path}")
+        logger.info(f"Generation finished in {generation_time:.2f} seconds.")
+
+        # Return file response
+        return FileResponse(
+            path=final_output_path,
+            media_type="audio/wav",
+            filename=Path(final_output_path).name,
+            headers={
+                "X-Generation-Time": f"{generation_time:.2f}",
+                "X-File-Size": f"{Path(final_output_path).stat().st_size}",
+                "X-Effects-Applied": ",".join(detected_effects + ([x_effect_type] if x_effect_type else []))
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error during inference: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.post("/api/generate-direct")
+async def run_inference_direct(request: GenerateRequest):
+    """
+    Original endpoint for direct API calls with explicit parameters.
     """
     if not request.text_input or request.text_input.strip() == "":
         raise HTTPException(status_code=400, detail="Text input cannot be empty.")
 
-    # Validate text input length
-    if len(request.text_input) > 1000:
-        raise HTTPException(status_code=400, detail="Text input too long. Maximum 1000 characters allowed.")
+    # Extract text and effects
+    clean_text, detected_effects = extract_text_and_effects(request.text_input)
+    
+    if not clean_text:
+        raise HTTPException(status_code=400, detail="No text found after removing effects")
 
     # Generate unique filename
     timestamp = int(time.time())
@@ -197,9 +479,9 @@ async def run_inference(request: GenerateRequest):
 
         start_time = time.time()
 
-        # Prepare inputs
+        # Prepare inputs with clean text
         processor_inputs = processor(
-            text=[request.text_input],
+            text=[clean_text],
             padding=True,
             return_tensors="pt"
         )
@@ -210,8 +492,8 @@ async def run_inference(request: GenerateRequest):
 
         # Generate audio
         with torch.inference_mode():
-            logger.info(f"Starting generation with parameters: max_tokens={request.max_new_tokens}, "
-                       f"cfg_scale={request.cfg_scale}, temperature={request.temperature}")
+            logger.info(f"Starting generation for text: '{clean_text}'")
+            logger.info(f"Detected effects: {detected_effects}")
             
             outputs = model.generate(
                 **processor_inputs,
@@ -221,38 +503,38 @@ async def run_inference(request: GenerateRequest):
                 top_p=request.top_p,
                 top_k=request.cfg_filter_top_k
             )
-            
-            logger.info(f"Generation completed. Output type: {type(outputs)}")
 
         # Decode and save audio
         decoded = processor.batch_decode(outputs)
         processor.save_audio(decoded, str(output_filepath))
         
+        # Apply sound effects if any were detected
+        final_output_path = str(output_filepath)
+        if detected_effects:
+            for effect in detected_effects:
+                logger.info(f"Adding sound effect: {effect}")
+                final_output_path = add_sound_effect_to_audio(final_output_path, effect, "end")
+                if final_output_path != str(output_filepath) and os.path.exists(str(output_filepath)):
+                    os.remove(str(output_filepath))
+        
         end_time = time.time()
         generation_time = end_time - start_time
         
-        logger.info(f"Audio saved to {output_filepath}")
+        logger.info(f"Final audio saved to {final_output_path}")
         logger.info(f"Generation finished in {generation_time:.2f} seconds.")
 
         # Return file response
         return FileResponse(
-            path=str(output_filepath),
+            path=final_output_path,
             media_type="audio/wav",
-            filename=output_filepath.name,
+            filename=Path(final_output_path).name,
             headers={
                 "X-Generation-Time": f"{generation_time:.2f}",
-                "X-File-Size": f"{output_filepath.stat().st_size}"
+                "X-File-Size": f"{Path(final_output_path).stat().st_size}",
+                "X-Effects-Applied": ",".join(detected_effects)
             }
         )
 
-    except RuntimeError as e:
-        if "CUDA out of memory" in str(e):
-            logger.error("CUDA out of memory error")
-            raise HTTPException(status_code=500, detail="GPU memory exhausted. Try reducing input size.")
-        else:
-            logger.error(f"Runtime error during inference: {e}")
-            raise HTTPException(status_code=500, detail=f"Runtime error: {str(e)}")
-            
     except Exception as e:
         logger.error(f"Error during inference: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
@@ -265,6 +547,27 @@ async def run_inference(request: GenerateRequest):
                 logger.info(f"Cleaned up temporary file: {prompt_path_for_generate}")
             except Exception as e:
                 logger.warning(f"Error cleaning up temporary file: {e}")
+
+@app.get("/api/effects")
+async def get_supported_effects():
+    """Get list of supported sound effects."""
+    return {
+        "effects": list(SOUND_EFFECTS.keys()),
+        "descriptions": {
+            "burps": "Short burping sound",
+            "clears throat": "Throat clearing sound",
+            "coughs": "Coughing sound",
+            "exhales": "Exhalation breath",
+            "gasps": "Gasp of surprise",
+            "groans": "Groaning sound",
+            "humming": "Humming tone",
+            "laughs": "Laughter",
+            "mumbles": "Mumbling speech",
+            "screams": "Scream",
+            "sighs": "Sigh of relief",
+            "sneezes": "Sneezing sound"
+        }
+    }
 
 @app.get("/api/stats")
 async def get_stats():
@@ -284,3 +587,8 @@ async def get_stats():
     except Exception as e:
         logger.error(f"Error getting stats: {e}")
         raise HTTPException(status_code=500, detail="Error retrieving statistics")
+
+# Add this to your requirements.txt:
+# soundfile==0.12.1
+# scipy==1.13.1
+# numpy==1.26.4
