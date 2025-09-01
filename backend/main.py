@@ -318,6 +318,8 @@ _TTS_KEYS = {
     "top_k": int,
     "cfg": float,              # guidance_scale
     "max_new_tokens": int,
+    "voice": str,
+    "language": str,
     "speed": float,            # available for future use
 }
 
@@ -351,6 +353,12 @@ def apply_overrides(base: dict, overrides: dict):
         out["guidance_scale"] = clamp(overrides["cfg"], 0.1, 10.0)
     if "max_new_tokens" in overrides:
         out["max_new_tokens"] = int(clamp(overrides["max_new_tokens"], 1, 4096))
+    
+    if "voice" in overrides:
+        out["voice"] = overrides["voice"]
+    if "language" in overrides:
+        out["language"] = overrides["language"]
+
     # "speed" kept for future use (DSP or model, if supported)
     return out
 
@@ -407,7 +415,12 @@ async def _generate_audio_to_file(clean_text: str, gen_kwargs: dict, tmp_path: P
 
     outputs = await anyio.to_thread.run_sync(_gen)
     decoded = processor.batch_decode(outputs)
-    processor.save_audio(decoded, str(tmp_path))
+    kwargs = {}
+    if "voice" in gen_kwargs:
+        kwargs["voice"] = gen_kwargs["voice"]
+    if "language" in gen_kwargs:
+        kwargs["language"] = gen_kwargs["language"]
+    processor.save_audio(decoded, str(tmp_path), **kwargs)
 
 async def process_speech_generation(request: VapiRequest):
     text_in = extract_text_from_vapi_payload(request)
